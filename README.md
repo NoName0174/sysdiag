@@ -1,2 +1,2 @@
 # sysdiag
-My own system diagnostic cli.
+My own linux system diagnostic cli.
