@@ -38,6 +38,7 @@ sudo pacman -S smartmontools ldns pacman-contrib
 ## Install
 
 ```fish
+cd ~/Downloads
 cp sysdiag ~/.local/bin/sysdiag
 chmod +x ~/.local/bin/sysdiag
 ```
