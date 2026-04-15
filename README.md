@@ -15,3 +15,22 @@ A full system diagnostic CLI for Arch-based Linux systems running Hypr.
 - **Dmesg** — warnings and above since boot
 - **Network** — interface, IP, gateway, ping latency, DNS timing, open ports, firewall rules
 - **Security** — last logins, SSH failures, SUID binary count, pending updates
+
+## Dependencies
+
+| Package | Purpose |
+|---|---|
+| `fish` | shell |
+| `procps` | ps, /proc reading |
+| `iproute2` | ip, ss |
+| `systemd` | systemctl, journalctl |
+| `smartmontools` | smartctl (NVMe/SSD health) |
+| `ldns` | drill (DNS timing) |
+| `iptables` | firewall rule count |
+| `pacman-contrib` | checkupdates |
+
+Install all at once:
+
+```bash
+sudo pacman -S smartmontools ldns pacman-contrib
+```
