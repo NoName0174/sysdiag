@@ -1,6 +1,6 @@
 # sysdiag
 
-A full system diagnostic CLI for Arch-based Linux systems running Hypr. 
+A full system diagnostic CLI for Arch-based Linux systems running Hyprland. Optionally themed via a simple accent color config.
 
 ![shell](https://img.shields.io/badge/shell-fish-blue) ![distro](https://img.shields.io/badge/distro-arch%20%2F%20cachyos-teal)
 
@@ -40,7 +40,6 @@ sudo pacman -S smartmontools ldns pacman-contrib
 ## Install
 
 ```fish
-cd ~/Downloads
 cp sysdiag ~/.local/bin/sysdiag
 chmod +x ~/.local/bin/sysdiag
 ```
@@ -54,6 +53,23 @@ sysdiag        # one-shot diagnostic
 sysdiag -w     # watch mode, refreshes every 10s
 ```
 
+## Theming (optional)
+
+By default sysdiag renders in black and white. To set an accent color, create the config file with any 6-character hex value (no `#` prefix):
+
+```fish
+mkdir -p ~/.config/sysdiag
+echo "e8730a" > ~/.config/sysdiag/accent
+```
+
+### Automatic theme switching
+
+Write to `~/.config/sysdiag/accent` from any wallpaper or theme daemon to have sysdiag follow your desktop theme:
+
+```fish
+echo "cc0000" > ~/.config/sysdiag/accent
+```
+
 ## Notes
 
 - SMART queries require `sudo`. Add a sudoers rule to avoid the password prompt:
@@ -62,5 +78,3 @@ sysdiag -w     # watch mode, refreshes every 10s
   ```
 - Fan speeds via thinkpad_acpi: `sudo modprobe thinkpad_acpi fan_control=1`
 - DNS timing requires `drill` from the `ldns` package
-
-
