@@ -52,4 +52,13 @@ sysdiag        # one-shot diagnostic
 sysdiag -w     # watch mode, refreshes every 10s
 ```
 
+## Notes
+
+- SMART queries require `sudo`. Add a sudoers rule to avoid the password prompt:
+  ```
+  YOUR_USER ALL=(ALL) NOPASSWD: /usr/bin/smartctl
+  ```
+- Fan speeds via thinkpad_acpi: `sudo modprobe thinkpad_acpi fan_control=1`
+- DNS timing requires `drill` from the `ldns` package
+
 
