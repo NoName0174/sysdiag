@@ -2,6 +2,8 @@
 
 A full system diagnostic CLI for Arch-based Linux systems running Hypr. 
 
+![shell](https://img.shields.io/badge/shell-fish-blue) ![distro](https://img.shields.io/badge/distro-arch%20%2F%20cachyos-teal)
+
 ## Features
 
 - **CPU** — aggregate usage, per-core breakdown, iowait, context switches, interrupts
