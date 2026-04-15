@@ -34,3 +34,13 @@ Install all at once:
 ```bash
 sudo pacman -S smartmontools ldns pacman-contrib
 ```
+
+## Install
+
+```fish
+cp sysdiag ~/.local/bin/sysdiag
+chmod +x ~/.local/bin/sysdiag
+```
+
+Make sure `~/.local/bin` is in your `$PATH`.
+
