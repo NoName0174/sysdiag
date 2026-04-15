@@ -45,3 +45,11 @@ chmod +x ~/.local/bin/sysdiag
 
 Make sure `~/.local/bin` is in your `$PATH`.
 
+## Usage
+
+```fish
+sysdiag        # one-shot diagnostic
+sysdiag -w     # watch mode, refreshes every 10s
+```
+
+
