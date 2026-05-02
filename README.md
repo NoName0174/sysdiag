@@ -75,4 +75,3 @@ echo "cc0000" > ~/.config/sysdiag/accent
 - SMART and firewall queries require elevated privileges. sysdiag prompts for sudo once on launch and caches credentials for the session
 - Fan speeds via thinkpad_acpi: `sudo modprobe thinkpad_acpi fan_control=1`
 - DNS timing requires `drill` from the `ldns` package
-- To increase sudo password attempts: `echo "Defaults passwd_tries=5" >> /etc/sudoers.d/tries`
