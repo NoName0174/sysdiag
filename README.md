@@ -2,13 +2,13 @@
 
 A btop-style terminal UI for diagnosing Arch-based Linux systems. Runs entirely in your terminal using Python's built-in `curses` library — no extra dependencies.
 
-![shell](https://img.shields.io/badge/language-python3-blue) ![distro](https://img.shields.io/badge/distro-arch%20%2F%20cachyos-teal)
+![language](https://img.shields.io/badge/language-python3-blue) ![distro](https://img.shields.io/badge/distro-arch%20%2F%20cachyos-teal)
 
 ## Features
 
 All panels are visible at once and refresh every 2 seconds in the background:
 
-- **CPU** — aggregate usage, per-core breakdown, iowait, frequency, context switches, interrupts
+- **CPU** — aggregate usage, per-core percentages, iowait, frequency, context switches, interrupts
 - **Memory** — usage, swap, dirty pages, writeback pressure, hugepages, edac error detection
 - **Temperatures & Fans** — all thermal zones and hwmon sensors, color-coded by severity
 - **GPU & Storage** — integrated/nvidia GPU usage, SMART health per drive
@@ -16,15 +16,16 @@ All panels are visible at once and refresh every 2 seconds in the background:
 - **Systemd & Journal** — failed units, last 4 journal errors
 - **Network** — interface, IP, gateway, ping latency, DNS timing, open ports, firewall rules, dmesg warnings
 - **Security** — SUID binary count, SSH failures, pending updates, last logins
+- **Partitions** — all disks and partitions with filesystem, mountpoints, size, used, and available space
 
 ## Dependencies
 
 | Package | Purpose |
 |---|---|
 | `python3` | runtime (stdlib only) |
-| `smartmontools` | SMART health queries |
+| `smartmontools` | SMART health queries (requires root) |
 | `ldns` | DNS timing via drill |
-| `iptables` | firewall rule count |
+| `iptables` | firewall rule count (requires root) |
 | `pacman-contrib` | checkupdates |
 
 Install all at once:
@@ -48,6 +49,8 @@ Make sure `~/.local/bin` is in your `$PATH`.
 sysdiag
 ```
 
+You will be prompted for your sudo password once on launch. This is used for SMART queries and firewall rules. Credentials are cached for the session.
+
 Press `q` or `Escape` to quit.
 
 ## Theming (optional)
@@ -69,9 +72,7 @@ echo "cc0000" > ~/.config/sysdiag/accent
 
 ## Notes
 
-- SMART queries require `sudo`. Add a sudoers rule to avoid the password prompt:
-  ```
-  YOUR_USER ALL=(ALL) NOPASSWD: /usr/bin/smartctl
-  ```
+- SMART and firewall queries require elevated privileges. sysdiag prompts for sudo once on launch and caches credentials for the session
 - Fan speeds via thinkpad_acpi: `sudo modprobe thinkpad_acpi fan_control=1`
 - DNS timing requires `drill` from the `ldns` package
+- To increase sudo password attempts: `echo "Defaults passwd_tries=5" >> /etc/sudoers.d/tries`
