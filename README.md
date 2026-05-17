@@ -1,10 +1,30 @@
 # sysdiag
 
-A btop-style terminal UI for diagnosing Arch-based Linux systems. Runs entirely in your terminal using Python's built-in `curses` library — no extra dependencies.
+A system diagnostic & repair TUI for Arch-based Linux systems. Two modes:
+
+- **Default** — problem detection menu (iwctl-style) with inline fix overlays
+- **`--monitor`** — live dashboard (btop-like) with CPU, memory, disks, network, processes, temperatures
 
 ![language](https://img.shields.io/badge/language-python3-blue) ![distro](https://img.shields.io/badge/distro-arch%20%2F%20cachyos-teal)
 
-## Features
+## Modes
+
+### Default mode (repair tool)
+
+Scans for system problems and presents them as a numbered, selectable list:
+
+- SMART health, CPU/GPU temperatures, EDAC memory errors
+- Battery wear, failed systemd units, zombie processes, OOM kills
+- Journal size, disk capacity, DNS latency, SSH auth failures, long uptime
+
+Press **↑↓** to navigate, **Enter** to inspect a problem, then **y** to execute the suggested fix or **n / ESC** to cancel. Number keys **1–9** jump directly to fixable items. Press **q** or **ESC** to quit.
+
+```fish
+sysdiag             # scan real system
+sysdiag --test      # demo mode with 12 simulated problems
+```
+
+### Monitor mode (`--monitor`)
 
 All panels are visible at once and refresh every 2 seconds in the background:
 
@@ -18,17 +38,22 @@ All panels are visible at once and refresh every 2 seconds in the background:
 - **Security** — SUID binary count, SSH failures, pending updates, last logins
 - **Partitions** — all disks and partitions with filesystem, mountpoints, size, used, and available space
 
+```fish
+sysdiag --monitor
+```
+
 ## Dependencies
 
 | Package | Purpose |
 |---|---|
-| `python3` | runtime (stdlib only) |
-| `smartmontools` | SMART health queries (requires root) |
-| `ldns` | DNS timing via drill |
-| `iptables` | firewall rule count (requires root) |
+| `smartmontools` | smartctl (NVMe/SSD health) |
+| `ldns` | drill (DNS timing) |
+| `iptables` | firewall rule count |
 | `pacman-contrib` | checkupdates |
 
-Install all at once:
+All required Python modules are in the stdlib (curses, threading, json, etc.).
+
+Install system deps:
 
 ```bash
 sudo pacman -S smartmontools ldns pacman-contrib
@@ -41,12 +66,10 @@ cp sysdiag ~/.local/bin/sysdiag
 chmod +x ~/.local/bin/sysdiag
 ```
 
-Make sure `~/.local/bin` is in your `$PATH`.
+Make sure `~/.local/bin` is in your `$PATH`. If you use fish:
 
-## Usage
-
-```bash
-sysdiag
+```fish
+fish_add_path ~/.local/bin
 ```
 
 You will be prompted for your sudo password once on launch. This is used for SMART queries and firewall rules. Credentials are cached for the session.
@@ -55,7 +78,7 @@ Press `q` or `Escape` to quit.
 
 ## Theming (optional)
 
-By default sysdiag renders in black and white. To set an accent color, create the config file with any 6-character hex value (no `#` prefix):
+Create `~/.config/sysdiag/accent` with a 6-character hex value (no `#`):
 
 ```bash
 mkdir -p ~/.config/sysdiag
@@ -73,5 +96,5 @@ echo "cc0000" > ~/.config/sysdiag/accent
 ## Notes
 
 - SMART and firewall queries require elevated privileges. sysdiag prompts for sudo once on launch and caches credentials for the session
-- Fan speeds via thinkpad_acpi: `sudo modprobe thinkpad_acpi fan_control=1`
 - DNS timing requires `drill` from the `ldns` package
+- Monitor mode runs without sudo (no external commands needed for display)
