@@ -1,11 +1,11 @@
 # sysdiag
 
-A system diagnostic & repair TUI for Arch-based Linux systems. Two modes:
+A system diagnostic & repair TUI for Linux systems. Two modes:
 
 - **Default** — problem detection menu (iwctl-style) with inline fix overlays
 - **`--monitor`** — live dashboard (btop-like) with CPU, memory, disks, network, processes, temperatures
 
-![language](https://img.shields.io/badge/language-python3-blue) ![distro](https://img.shields.io/badge/distro-arch%20%2F%20cachyos-teal)
+![language](https://img.shields.io/badge/language-python3-blue) ![distro](https://img.shields.io/badge/multi--distro-teal)
 
 ## Modes
 
@@ -49,14 +49,18 @@ sysdiag --monitor
 | `smartmontools` | smartctl (NVMe/SSD health) |
 | `ldns` | drill (DNS timing) |
 | `iptables` | firewall rule count |
-| `pacman-contrib` | checkupdates |
 
 All required Python modules are in the stdlib (curses, threading, json, etc.).
 
 Install system deps:
 
 ```bash
-sudo pacman -S smartmontools ldns pacman-contrib
+# arch
+sudo pacman -S smartmontools ldns
+# debian/ubuntu
+sudo apt install smartmontools ldns iptables
+# fedora
+sudo dnf install smartmontools ldns iptables
 ```
 
 ## Install

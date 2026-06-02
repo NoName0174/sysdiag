@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+# sysdiag v3.1 — btop-style TUI diagnostic
+# deps: python3 (stdlib only), smartmontools, ldns, iptables
+
+import curses
+import os
+import re
+import subprocess
+import time
+import threading
+import json
+import shutil
+from pathlib import Path
+
+REFRESH = 2
+
+# ── accent ────────────────────────────────────────────────────────────────────
+def load_accent():
+    try:
+        h = Path("~/.config/sysdiag/accent").expanduser().read_text().strip()
+        return int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+    except Exception:
+        return None
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def sh(cmd, fallback=""):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=3).decode().strip()
+    except Exception:
+        return fallback
+
+def read(path, fallback=""):
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return fallback
+
+def human(b):
+    for u in ["B","KB","MB","GB","TB"]:
+        if b < 1024: return f"{b:.2f} {u}"
+        b /= 1024
+    return f"{b:.2f} PB"
+
+def gb(kb):
+    return f"{kb/1024/1024:.1f}"
+
+def bar(pct, w):
+    f = round(pct * w / 100)
+    return "#" * f + "." * (w - f)
+
+def sadd(win, y, x, text, attr=0):
+    try:
+        h, w = win.getmaxyx()
+        if y < 0 or y >= h-1 or x < 0: return
+        win.addstr(y, x, str(text)[:max(0, w-x-1)], attr)
+    except curses.error:
+        pass
+
+def draw_box(win, title, cp_bdr, cp_title):
+    try:
+        h, w = win.getmaxyx()
+        win.attron(cp_bdr)
+        win.border()
+        for r in range(1, h-1):
+            win.addstr(r, 1, " " * (w-2))
+        win.attroff(cp_bdr)
+        if title:
+            win.attron(cp_title | curses.A_BOLD)
+            win.addstr(0, 2, f" {title} "[:w-4])
+            win.attroff(cp_title | curses.A_BOLD)
+    except curses.error:
+        pass
+
+# ── data ──────────────────────────────────────────────────────────────────────
+class Data:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.d = {}
+        self.collect()
+
+    def collect(self):
+        d = {}
+
+        # cpu
+        def cpu_stat():
+            line = Path("/proc/stat").read_text().splitlines()[0].split()
+            v = list(map(int, line[1:]))
+            return sum(v), v[3]
+        def core_stats():
+            lines = [l for l in Path("/proc/stat").read_text().splitlines() if re.match(r"cpu\d",l)]
+            return [(sum(v:=list(map(int,l.split()[1:]))), v[3]) for l in lines]
+
+        t1,i1 = cpu_stat(); c1 = core_stats()
+        time.sleep(0.5)
+        t2,i2 = cpu_stat(); c2 = core_stats()
+        dt = t2-t1
+        d["cpu_pct"] = round(100*(dt-(i2-i1))/dt) if dt else 0
+        d["cpu_cores"] = []
+        for (ct1,ci1),(ct2,ci2) in zip(c1,c2):
+            dct = ct2-ct1
+            d["cpu_cores"].append(round(100*(dct-(ci2-ci1))/dct) if dct else 0)
+        stat = Path("/proc/stat").read_text()
+        d["ctx"]  = re.search(r"^ctxt (\d+)",  stat, re.M).group(1) if re.search(r"^ctxt",  stat, re.M) else "?"
+        d["intr"] = re.search(r"^intr (\d+)",  stat, re.M).group(1) if re.search(r"^intr",  stat, re.M) else "?"
+        iv = list(map(int, stat.splitlines()[0].split()[1:]))
+        it = sum(iv)
+        d["iowait"] = f"{100*iv[4]/it:.1f}" if it else "0"
+        try:
+            d["cpu_freq"] = f"{int(read('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'))//1000} MHz"
+        except:
+            d["cpu_freq"] = "n/a"
+
+        # temps
+        d["temps"] = []
+        for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
+            t = read(zone/"temp")
+            if t: d["temps"].append(f"{read(zone/'type')}:{int(t)//1000}C")
+
+        # fans
+        d["fans"] = []
+        for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+            for f in sorted(hwmon.glob("fan*_input")):
+                v = read(f)
+                if v and v != "0":
+                    lbl = read(str(f).replace("_input","_label")) or f.name
+                    d["fans"].append(f"{lbl}:{v} RPM")
+
+        # memory
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            p = line.split(":")
+            if len(p)==2:
+                try: mem[p[0].strip()] = int(p[1].strip().split()[0])
+                except: pass
+        d["mem_total"]  = mem.get("MemTotal",0)
+        d["mem_avail"]  = mem.get("MemAvailable",0)
+        d["mem_used"]   = d["mem_total"]-d["mem_avail"]
+        d["mem_pct"]    = round(d["mem_used"]*100/d["mem_total"]) if d["mem_total"] else 0
+        d["dirty_mb"]   = mem.get("Dirty",0)//1024
+        d["wb_mb"]      = mem.get("Writeback",0)//1024
+        d["huge_total"] = mem.get("HugePages_Total",0)
+        d["huge_free"]  = mem.get("HugePages_Free",0)
+        d["swap_total"] = mem.get("SwapTotal",0)
+        d["swap_used"]  = d["swap_total"]-mem.get("SwapFree",0)
+        errs = 0
+        edac = Path("/sys/devices/system/edac/mc")
+        if edac.exists():
+            for f in list(edac.glob("*/ce_count"))+list(edac.glob("*/ue_count")):
+                try: errs += int(read(f))
+                except: pass
+        d["mem_errors"] = errs
+
+        # gpu
+        if os.path.exists("/usr/bin/nvidia-smi"):
+            d["gpu"] = sh("nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu --format=csv,noheader,nounits")
+        elif Path("/sys/class/drm/card0/device/gpu_busy_percent").exists():
+            d["gpu"] = f"integrated  {read('/sys/class/drm/card0/device/gpu_busy_percent')}% busy"
+        else:
+            d["gpu"] = "no GPU data"
+
+        # smart
+        d["smart"] = []
+        for dev in ["/dev/nvme0","/dev/sda","/dev/sdb"]:
+            if Path(dev).exists():
+                out = sh(f"sudo -n smartctl -H {dev}")
+                m = re.search(r"(?:overall-health|result).*?:\s*(\S+)", out, re.I)
+                if m: d["smart"].append((dev, m.group(1)))
+        if not d["smart"]: d["smart"] = [("n/a","run as root")]
+
+        # processes
+        d["procs"] = []
+        for line in sh("ps --no-headers -eo pid,comm,%cpu --sort=-%cpu").splitlines()[:5]:
+            p = line.split(None,2)
+            if len(p)==3: d["procs"].append(p)
+        d["zombies"]    = sh("ps --no-headers -eo stat | grep -c '^Z'","0")
+        d["oom_events"] = sh("journalctl -k --since today 2>/dev/null | grep -c 'Out of memory\\|oom_kill'","0")
+
+        # systemd
+        d["failed_units"] = [l for l in sh("systemctl --failed --no-legend").splitlines() if l.strip()]
+        d["journal_errs"] = sh("journalctl -p err -n 4 --no-pager --no-hostname -o short").splitlines()
+
+        # dmesg
+        d["dmesg"] = sh("dmesg --level=warn,err,crit,alert,emerg").splitlines()[-5:]
+
+        # network
+        d["iface"]    = sh("ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i==\"dev\") print $(i+1)}'")
+        d["ip"]       = sh(f"ip -4 addr show {d['iface']} 2>/dev/null | awk '/inet /{{print $2}}' | cut -d/ -f1")
+        d["gw"]       = sh("ip route 2>/dev/null | awk '/default/{print $3; exit}'")
+        d["ping_gw"]  = sh(f"ping -c1 -W1 {d['gw']} 2>/dev/null | awk -F'/' '/rtt/{{printf \"%.1fms\",$5}}'","timeout")
+        d["ping_ext"] = sh("ping -c1 -W1 1.1.1.1 2>/dev/null | awk -F'/' '/rtt/{printf \"%.1fms\",$5}'","timeout")
+        d["dns_ms"]   = sh("bash -c 't=$(($(date +%s%3N))); drill archlinux.org @1.1.1.1 >/dev/null 2>&1; echo $(($(date +%s%3N)-t))'","n/a")
+        d["ports"]    = sh("ss -tlnp 2>/dev/null | awk 'NR>1{print $4}' | grep -oP ':\\K\\d+' | sort -un | tr '\\n' ' '")
+        d["fw"] = sh("sudo -n iptables -L INPUT -n 2>/dev/null | grep -cE '^(ACCEPT|DROP|REJECT)'","n/a")
+
+        # security
+        d["last_logins"] = [l for l in sh("last -n 4 --time-format iso 2>/dev/null").splitlines() if l and "wtmp" not in l][:4]
+        d["ssh_fails"]   = sh("journalctl _SYSTEMD_UNIT=sshd.service 2>/dev/null | grep -c 'Failed password\\|Invalid user'","0")
+        d["suid"]        = sh("find /usr/bin /usr/sbin /bin /sbin -perm /4000 2>/dev/null | wc -l","?")
+        updates_cmds = [
+            ("pacman","checkupdates 2>/dev/null | wc -l","pacman -Qu 2>/dev/null | wc -l"),
+            ("apt-get","apt list --upgradable 2>/dev/null | grep -c upgradable",""),
+            ("dnf","dnf check-update --quiet 2>/dev/null | wc -l",""),
+            ("zypper","zypper list-updates 2>/dev/null | wc -l",""),
+            ("xbps-install","xbps-install -un 2>/dev/null | wc -l",""),
+        ]
+        upd = "n/a"
+        for pm,cmd,alt in updates_cmds:
+            if shutil.which(pm):
+                upd = sh(cmd, sh(alt,"n/a") if alt else "n/a")
+                if not upd.isdigit(): upd = "n/a"
+                break
+        d["updates"] = upd
+
+        # partitions
+        d["disks"] = []
+        try:
+            raw = sh("lsblk -Jbpo NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL")
+            blk = json.loads(raw)
+
+            df_data = {}
+            for line in sh("df -B1 --output=source,used,avail 2>/dev/null").splitlines()[1:]:
+                pf = line.split()
+                if len(pf)==3:
+                    df_data[pf[0]] = (int(pf[1]), int(pf[2]))
+
+            findmnt_data = {}
+            for line in sh("findmnt -rno SOURCE,TARGET 2>/dev/null").splitlines():
+                pf = line.split(None,1)
+                if len(pf)==2:
+                    dev_name = re.sub(r'\[.*?\]','',pf[0])
+                    findmnt_data.setdefault(dev_name,[]).append(pf[1])
+
+            for dev in blk.get("blockdevices",[]):
+                disk_size = int(dev.get("size") or 0)
+                children  = dev.get("children") or []
+                parts = []
+                for child in children:
+                    csize  = int(child.get("size") or 0)
+                    cname  = child.get("name") or "?"
+                    used,avail = df_data.get(cname,(None,None))
+                    mounts = findmnt_data.get(cname,[])
+                    parts.append({
+                        "name":   cname,
+                        "size_b": csize,
+                        "size":   human(csize),
+                        "fstype": child.get("fstype") or "",
+                        "mounts": mounts,
+                        "label":  child.get("label") or "",
+                        "used":   human(used) if used is not None else "",
+                        "avail":  human(avail) if avail is not None else "",
+                    })
+
+                unalloc = disk_size - sum(pt["size_b"] for pt in parts)
+                if unalloc > 1024*1024:
+                    parts.append({
+                        "name":"unallocated","size_b":unalloc,"size":human(unalloc),
+                        "fstype":"","mounts":[],"label":"","used":"","avail":"",
+                    })
+
+                d["disks"].append({
+                    "name":   dev.get("name") or "?",
+                    "size":   human(disk_size),
+                    "size_b": disk_size,
+                    "label":  dev.get("label") or "",
+                    "parts":  parts,
+                })
+        except Exception:
+            pass
+
+        with self.lock:
+            self.d = d
+
+    def get(self):
+        with self.lock:
+            return dict(self.d)
+
+# ── draw ──────────────────────────────────────────────────────────────────────
+def draw(stdscr, data_obj):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(200)
+    curses.start_color()
+    curses.use_default_colors()
+
+    accent = load_accent()
+    if accent and curses.can_change_color():
+        r,g,b = accent
+        curses.init_color(10, r*1000//255, g*1000//255, b*1000//255)
+        curses.init_pair(1, 10, -1)
+    else:
+        curses.init_pair(1, curses.COLOR_YELLOW, -1)
+    curses.init_pair(2, curses.COLOR_WHITE,  -1)
+    curses.init_pair(3, curses.COLOR_GREEN,  -1)
+    curses.init_pair(4, curses.COLOR_RED,    -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+    curses.init_pair(6, curses.COLOR_CYAN,   -1)
+
+    AC = curses.color_pair(1)
+    NM = curses.color_pair(2)
+    OK = curses.color_pair(3)
+    ER = curses.color_pair(4)
+    WN = curses.color_pair(5)
+    DM = curses.color_pair(6)
+
+    last_refresh = 0
+
+    while True:
+        key = stdscr.getch()
+        if key in (ord('q'), ord('Q'), 27):
+            break
+
+        now = time.time()
+        if now - last_refresh >= REFRESH:
+            threading.Thread(target=data_obj.collect, daemon=True).start()
+            last_refresh = now
+
+        d = data_obj.get()
+        if not d:
+            continue
+
+        H, W = stdscr.getmaxyx()
+        stdscr.erase()
+
+        hn = sh("uname -n")
+        ts = time.strftime("%A %d %B %Y  %H:%M:%S")
+        sadd(stdscr, 0, 0, f" sysdiag  {hn}  {ts} ".center(W), AC | curses.A_BOLD)
+
+        usable = H - 2
+        disks  = d.get("disks",[])
+        part_lines = sum(1 + len(dk["parts"]) + sum(len(pt["mounts"]) for pt in dk["parts"]) for dk in disks)
+        part_h = max(4, min(part_lines + 2, usable // 2))
+        top_h  = usable - part_h
+
+        r1h = max(6, top_h * 22 // 100)
+        r2h = max(6, top_h * 18 // 100)
+        r3h = max(7, top_h * 25 // 100)
+        r4h = max(6, top_h - r1h - r2h - r3h)
+
+        lw = W * 55 // 100
+        rw = W - lw
+        ry = [1, 1+r1h, 1+r1h+r2h, 1+r1h+r2h+r3h]
+
+        def pan(ri, side):
+            h = [r1h,r2h,r3h,r4h][ri]
+            return stdscr.derwin(h, lw, ry[ri], 0) if side=="l" else stdscr.derwin(h, rw, ry[ri], lw)
+
+        # ── cpu ───────────────────────────────────────────────────────────────
+        try:
+            p = pan(0,"l"); ph,pw = p.getmaxyx()
+            draw_box(p,"cpu",AC,AC)
+            pct = d.get("cpu_pct",0)
+            sadd(p,1,2,f"total: ",DM); sadd(p,1,9,f"{pct}%",NM|curses.A_BOLD)
+            sadd(p,1,13,f"  iowait: {d.get('iowait','?')}%  freq: {d.get('cpu_freq','?')}",DM)
+            sadd(p,2,2,bar(pct,pw-4),AC)
+            cores = d.get("cpu_cores",[])
+            core_str = "  ".join(f"c{i}:{cp}%" for i,cp in enumerate(cores))
+            sadd(p,3,2,core_str[:pw-4],DM)
+            sadd(p,ph-2,2,f"ctx: {d.get('ctx','?')}  intr: {d.get('intr','?')}",DM)
+        except Exception: pass
+
+        # ── memory ────────────────────────────────────────────────────────────
+        try:
+            p = pan(0,"r"); ph,pw = p.getmaxyx()
+            draw_box(p,"memory",AC,AC)
+            mt=d.get("mem_total",1); mu=d.get("mem_used",0); mp=d.get("mem_pct",0)
+            sadd(p,1,2,f"{gb(mu)} / {gb(mt)} GB  ({mp}%)",NM|curses.A_BOLD)
+            sadd(p,2,2,bar(mp,pw-4),AC)
+            st=d.get("swap_total",0); su=d.get("swap_used",0)
+            sp=round(su*100/st) if st else 0
+            sadd(p,3,2,f"swap: {gb(su)}/{gb(st)} GB ",DM)
+            sadd(p,3,20,bar(sp,pw-22),AC)
+            sadd(p,4,2,f"dirty: {d.get('dirty_mb',0)} MB  wb: {d.get('wb_mb',0)} MB  huge: {d.get('huge_free',0)}/{d.get('huge_total',0)}",DM)
+            errs=d.get("mem_errors",0)
+            sadd(p,5,2,"[ok] no memory errors" if not errs else f"[!!] edac errors: {errs}", OK if not errs else ER)
+        except Exception: pass
+
+        # ── temps & fans ──────────────────────────────────────────────────────
+        try:
+            p = pan(1,"l"); ph,pw = p.getmaxyx()
+            draw_box(p,"temperatures & fans",AC,AC)
+            x,y = 2,1
+            for t in d.get("temps",[]):
+                lbl,val = t.rsplit(":",1)
+                tc = int(re.sub(r"[^\d]","",val))
+                col = ER if tc>80 else WN if tc>65 else OK
+                txt = f"{lbl[:12]}:{val}  "
+                if x+len(txt)>pw-2: x=2; y+=1
+                if y>=ph-2: break
+                sadd(p,y,x,f"{lbl[:12]}:",DM)
+                sadd(p,y,x+len(lbl[:12])+1,val,col|curses.A_BOLD)
+                x+=len(txt)
+            y+=1
+            fans=d.get("fans",[])
+            sadd(p,y,2,("fans: "+"  ".join(fans)) if fans else "fans: no data",DM)
+        except Exception: pass
+
+        # ── gpu & storage ─────────────────────────────────────────────────────
+        try:
+            p = pan(1,"r"); ph,pw = p.getmaxyx()
+            draw_box(p,"gpu & storage",AC,AC)
+            sadd(p,1,2,"gpu:",DM); sadd(p,1,6,d.get("gpu","n/a")[:pw-8],NM)
+            sadd(p,2,2,"smart:",DM)
+            y=3
+            for dev,result in d.get("smart",[]):
+                col = OK if "PASSED" in result.upper() else ER
+                sadd(p,y,2,dev,DM); sadd(p,y,2+len(dev)+1,result,col|curses.A_BOLD)
+                y+=1
+                if y>=ph-1: break
+        except Exception: pass
+
+        # ── processes ─────────────────────────────────────────────────────────
+        try:
+            p = pan(2,"l"); ph,pw = p.getmaxyx()
+            draw_box(p,"processes",AC,AC)
+            sadd(p,1,2,f"{'PID':>6}  {'NAME':<20}  {'CPU%':>5}",DM)
+            for i,proc in enumerate(d.get("procs",[])):
+                pid,name,pct = proc
+                sadd(p,2+i,2,f"{pid:>6}  {name:<20}  ",DM)
+                sadd(p,2+i,32,f"{pct:>5}%",NM|curses.A_BOLD)
+            z=int(d.get("zombies",0)); oom=int(d.get("oom_events",0))
+            sadd(p,ph-2,2,"zombies: ",DM)
+            sadd(p,ph-2,11,str(z),ER|curses.A_BOLD if z else OK)
+            sadd(p,ph-2,14,"  oom today: ",DM)
+            sadd(p,ph-2,27,str(oom),ER|curses.A_BOLD if oom else OK)
+        except Exception: pass
+
+        # ── systemd & journal ─────────────────────────────────────────────────
+        try:
+            p = pan(2,"r"); ph,pw = p.getmaxyx()
+            draw_box(p,"systemd & journal",AC,AC)
+            fu=d.get("failed_units",[])
+            if fu:
+                sadd(p,1,2,"failed units:",ER)
+                for i,u in enumerate(fu[:2]): sadd(p,2+i,2,u[:pw-4],ER|curses.A_BOLD)
+            else:
+                sadd(p,1,2,"[ok] no failed units",OK)
+            sadd(p,3,2,"journal errors:",DM)
+            jerrs=d.get("journal_errs",[])
+            if jerrs:
+                for i,line in enumerate(jerrs[:ph-6]): sadd(p,4+i,2,line[:pw-4],WN)
+            else:
+                sadd(p,4,2,"[ok] clean",OK)
+        except Exception: pass
+
+        # ── network ───────────────────────────────────────────────────────────
+        try:
+            p = pan(3,"l"); ph,pw = p.getmaxyx()
+            draw_box(p,"network",AC,AC)
+            sadd(p,1,2,"iface: ",DM); sadd(p,1,9,d.get("iface","?"),NM|curses.A_BOLD)
+            sadd(p,1,17,"  ip: ",DM); sadd(p,1,23,d.get("ip","?"),NM)
+            sadd(p,2,2,f"gw: {d.get('gw','?')}  ping gw: {d.get('ping_gw','?')}  ext: {d.get('ping_ext','?')}  dns: {d.get('dns_ms','?')}ms",DM)
+            sadd(p,3,2,"ports: ",DM); sadd(p,3,9,(d.get("ports","") or "none")[:pw-12],NM)
+            sadd(p,4,2,f"fw rules (INPUT): {d.get('fw','?')}",DM)
+            dw=d.get("dmesg",[])
+            if dw:
+                sadd(p,5,2,"dmesg:",WN)
+                for i,line in enumerate(dw[:ph-8]): sadd(p,6+i,2,line[:pw-4],WN)
+            else:
+                sadd(p,5,2,"[ok] dmesg clean",OK)
+        except Exception: pass
+
+        # ── security ──────────────────────────────────────────────────────────
+        try:
+            p = pan(3,"r"); ph,pw = p.getmaxyx()
+            draw_box(p,"security",AC,AC)
+            sadd(p,1,2,f"suid: {d.get('suid','?')}  ssh fails: {d.get('ssh_fails','?')}  updates: {d.get('updates','?')}",NM)
+            sadd(p,2,2,"last logins:",DM)
+            for i,line in enumerate(d.get("last_logins",[])[:ph-5]):
+                sadd(p,3+i,2,line[:pw-4],DM)
+        except Exception: pass
+
+        # ── partitions ────────────────────────────────────────────────────────
+        try:
+            part_y = 1 + r1h + r2h + r3h + r4h
+            ph = H - 1 - part_y
+            if ph > 3:
+                p = stdscr.derwin(ph, W, part_y, 0)
+                draw_box(p, "partitions", AC, AC)
+                y = 1
+                for disk in disks:
+                    if y >= ph - 1: break
+                    # disk header line
+                    label = f"  ({disk['label']})" if disk['label'] else ""
+                    sadd(p, y, 2, f"{disk['name']}{label}  {disk['size']}", AC | curses.A_BOLD)
+                    y += 1
+
+                    for part in disk["parts"]:
+                        if y >= ph - 1: break
+                        is_unalloc = part["name"] == "unallocated"
+                        name_short = part["name"].replace("/dev/","")
+                        col = DM if is_unalloc else NM
+
+                        # build partition line
+                        fields = [f"  {name_short}"]
+                        if part["fstype"]: fields.append(part["fstype"])
+                        fields.append(part["size"])
+                        if part["used"]:  fields.append(f"used:{part['used']}")
+                        if part["avail"]: fields.append(f"avail:{part['avail']}")
+                        if part["label"]: fields.append(f"({part['label']})")
+
+                        sadd(p, y, 2, "  ".join(fields)[:W-4], col)
+                        y += 1
+
+                        # mountpoints indented below
+                        for mount in part["mounts"]:
+                            if y >= ph - 1: break
+                            sadd(p, y, 6, mount, DM)
+                            y += 1
+
+                    y += 1  # gap between disks
+        except Exception: pass
+
+        sadd(stdscr, H-1, 0, f" q quit  refresh every {REFRESH}s ".ljust(W), AC | curses.A_REVERSE)
+        stdscr.refresh()
+
+    try:
+        curses.endwin()
+    except Exception:
+        pass
+
+# ── entry ─────────────────────────────────────────────────────────────────────
+def main():
+    # authenticate once before TUI takes over the terminal
+    os.system("sudo -v")
+    data = Data()
+    try:
+        curses.wrapper(lambda s: draw(s, data))
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
