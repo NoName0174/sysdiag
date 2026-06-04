@@ -65,6 +65,8 @@ sudo dnf install smartmontools ldns iptables
 
 ## Install
 
+### Manual
+
 ```bash
 cp sysdiag ~/.local/bin/sysdiag
 chmod +x ~/.local/bin/sysdiag
@@ -75,6 +77,14 @@ Make sure `~/.local/bin` is in your `$PATH`. If you use fish:
 ```fish
 fish_add_path ~/.local/bin
 ```
+
+### Nix
+
+```bash
+nix run github:NoName0174/sysdiag
+```
+
+Or add the flake to your system configuration. Dependencies are auto-resolved.
 
 You will be prompted for your sudo password once on launch. This is used for SMART queries and firewall rules. Credentials are cached for the session.
 
