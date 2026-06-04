@@ -476,7 +476,11 @@ def draw(stdscr, data_obj):
             if ph > 3:
                 p = stdscr.derwin(ph, W, part_y, 0)
                 draw_box(p, "partitions", AC, AC)
-                y = 1
+                mt=d.get("mem_total",1); mu=d.get("mem_used",0)
+                st=d.get("swap_total",0); su=d.get("swap_used",0)
+                sadd(p,1,2,f"ram: {gb(mu)}/{gb(mt)} GB",DM)
+                sadd(p,1,22,f"swap: {gb(su)}/{gb(st)} GB",DM)
+                y = 2
                 for disk in disks:
                     if y >= ph - 1: break
                     # disk header line
