@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# sysdiag v3.1 — btop-style TUI diagnostic
+# sysdiag v3.1 — system diagnostic & repair TUI
 # deps: python3 (stdlib only), smartmontools, ldns, iptables
 
 import curses
@@ -9,9 +9,11 @@ import subprocess
 import time
 import threading
 import json
+import sys
 import shutil
 from pathlib import Path
 
+_fix_busy = threading.Event()
 REFRESH = 2
 
 # ── accent ────────────────────────────────────────────────────────────────────
@@ -29,6 +31,15 @@ def sh(cmd, fallback=""):
     except Exception:
         return fallback
 
+def sh_bg(cmd):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+        return (r.stdout.strip() or r.stderr.strip() or "done")[:120]
+    except subprocess.TimeoutExpired:
+        return "timed out"
+    except Exception as e:
+        return f"error: {e}"
+
 def read(path, fallback=""):
     try:
         return Path(path).read_text().strip()
@@ -41,6 +52,12 @@ def human(b):
         b /= 1024
     return f"{b:.2f} PB"
 
+def human_rate(b):
+    for u in ["B/s","KB/s","MB/s","GB/s"]:
+        if b < 1024: return f"{b:.2f} {u}"
+        b /= 1024
+    return f"{b:.2f} PB/s"
+
 def gb(kb):
     return f"{kb/1024/1024:.1f}"
 
@@ -48,11 +65,26 @@ def bar(pct, w):
     f = round(pct * w / 100)
     return "#" * f + "." * (w - f)
 
+SPARK = "▁▂▃▄▅▆▇█"
+def sparkline(vals, w):
+    if not vals:
+        return " " * w
+    lo, hi = min(vals), max(vals)
+    rng = hi - lo
+    out = ""
+    for v in vals:
+        if rng == 0:
+            out += SPARK[len(SPARK)//2]
+        else:
+            out += SPARK[min(len(SPARK)-1, int((v-lo) * (len(SPARK)-1) / rng))]
+    return out[:w].ljust(w)
+
 def sadd(win, y, x, text, attr=0):
     try:
         h, w = win.getmaxyx()
-        if y < 0 or y >= h-1 or x < 0: return
-        win.addstr(y, x, str(text)[:max(0, w-x-1)], attr)
+        if y < 0 or y >= h or x < 0: return
+        if x >= w: return
+        win.addstr(y, x, str(text)[:w-x], attr)
     except curses.error:
         pass
 
@@ -71,11 +103,178 @@ def draw_box(win, title, cp_bdr, cp_title):
     except curses.error:
         pass
 
+# ── problem detection ─────────────────────────────────────────────────────────
+SEV_INFO = 0
+SEV_WARN = 1
+SEV_CRIT = 2
+
+class Problem:
+    __slots__ = ("severity","title","detail","fix_label","fix_fn")
+    def __init__(self, severity, title, detail, fix_label=None, fix_fn=None):
+        self.severity = severity
+        self.title = title
+        self.detail = detail
+        self.fix_label = fix_label
+        self.fix_fn = fix_fn
+
+def detect_problems(d):
+    p = []
+
+    for dev, result in d.get("smart", []):
+        if "PASSED" not in result.upper():
+            p.append(Problem(SEV_CRIT, f"SMART FAILED: {dev}",
+                "Drive may fail soon. Back up immediately!",
+                "backup tips", lambda dev=dev: f"sudo dd if={dev} of=/backup/image.img status=progress"))
+
+    for t in d.get("temps", []):
+        if ":" in t:
+            lbl, val = t.rsplit(":", 1)
+            tc = int(re.sub(r"[^\d]", "", val))
+            if tc > 85:
+                p.append(Problem(SEV_CRIT, f"{tc}°C {lbl}",
+                    "Critical temp! Check fans, clean heatsink, repaste CPU.",
+                    "sensors", lambda: sh_bg("sensors 2>/dev/null | head -20")))
+            elif tc > 70:
+                p.append(Problem(SEV_WARN, f"{tc}°C {lbl}",
+                    "High temperature. Monitor closely.",
+                    "sensors", lambda: sh_bg("sensors 2>/dev/null | head -20")))
+
+    errs = d.get("mem_errors", 0)
+    if errs > 0:
+        p.append(Problem(SEV_CRIT, f"{errs} EDAC memory error(s)",
+            "Run memtest86, reseat RAM modules, check for bad DIMMs.",
+            "edac report", lambda: sh_bg("grep . /sys/devices/system/edac/mc/*/{ce,ue}_count 2>/dev/null | head -10")))
+
+    wear = d.get("battery_wear", 0)
+    if wear > 20:
+        p.append(Problem(SEV_WARN, f"Battery worn {wear:.0f}%",
+            f"Design: {d.get('battery_design',0)}Wh, current: {d.get('battery_now',0)}Wh. Replace soon.",
+            "battery info", lambda: sh_bg("upower -i /org/freedesktop/UPower/devices/battery_BAT0 2>/dev/null | head -15")))
+
+    if wear > 0 and d.get("battery_status","") == "Discharging" and d.get("battery_now",0) < 15:
+        p.append(Problem(SEV_WARN, f"Battery low ({d.get('battery_now',0)}%)",
+            "Plug in charger."))
+
+    fu = d.get("failed_units", [])
+    if fu:
+        names = " ".join(u.split()[0] for u in fu[:3])
+        p.append(Problem(SEV_CRIT, f"{len(fu)} failed systemd unit(s)",
+            f"Failed: {names}",
+            "restart all", lambda: sh_bg("systemctl restart " + " ".join(u.split()[0] for u in fu))))
+
+    z = int(d.get("zombies", 0))
+    if z > 0:
+        p.append(Problem(SEV_WARN, f"{z} zombie process(es)",
+            "Zombies consume PID table slots. Kill parent processes.",
+            "reap zombies", lambda: sh_bg("ps --no-headers -eo pid,stat | awk '/Z/{print $1}' | xargs -r kill -9")))
+
+    oom = int(d.get("oom_events", 0))
+    if oom > 3:
+        p.append(Problem(SEV_CRIT, f"{oom} OOM kill(s) today",
+            "Out of memory! Add swap or adjust vm.overcommit_ratio.",
+            "check memory", lambda: sh_bg("free -h; echo ---; vmstat -s 2>/dev/null | head -10")))
+    elif oom > 0:
+        p.append(Problem(SEV_WARN, f"{oom} OOM kill(s) today",
+            "Monitor memory pressure. Consider adding swap.",
+            "check swap", lambda: sh_bg("free -h; swapon --show")))
+
+    js = d.get("journal_size_mb", 0)
+    if js > 500:
+        p.append(Problem(SEV_WARN, f"Journal {js:.0f} MB",
+            "Systemd journal is large.",
+            "vacuum to 200M", lambda: sh_bg("journalctl --vacuum-size=200M")))
+
+    for disk in d.get("disks", []):
+        for part in disk["parts"]:
+            pct_used = part.get("used_frac", 0)
+            if pct_used > 0.90 and pct_used > 0:
+                name = part["name"].replace("/dev/","")
+                p.append(Problem(SEV_CRIT, f"{name} at {pct_used*100:.0f}% capacity",
+                    f"Low disk space. Clean up!",
+                    "auto-clean", lambda: sh_bg("sudo pacman -Sc; paccache -r; journalctl --vacuum-size=200M")))
+
+    dns = d.get("dns_ms", "")
+    if dns.replace(".","",1).lstrip("-").isdigit() and float(dns) > 1000:
+        p.append(Problem(SEV_WARN, f"DNS slow ({dns}ms)",
+            "Try: drill archlinux.org @8.8.8.8",
+            "test 1.1.1.1", lambda: sh_bg("drill archlinux.org @1.1.1.1 2>&1 | head -5")))
+    elif dns == "n/a":
+        p.append(Problem(SEV_WARN, "DNS resolution failed",
+            "Check connectivity or resolver config.",
+            "test 1.1.1.1", lambda: sh_bg("drill archlinux.org @1.1.1.1 2>&1 | head -5")))
+
+    sf = int(d.get("ssh_fails", 0))
+    if sf > 10:
+        p.append(Problem(SEV_CRIT, f"{sf} SSH auth failures",
+            "Consider fail2ban or disable password auth.",
+            "security tips", lambda: "Install: sudo pacman -S fail2ban; enable: sudo systemctl enable --now fail2ban"))
+
+    upt = d.get("uptime_days", 0)
+    if upt > 60:
+        p.append(Problem(SEV_INFO, f"Uptime {upt:.0f} days",
+            "Long uptime — consider rebooting for kernel updates.",
+            "reboot?", lambda: "sudo reboot"))
+
+    return p
+
+_test_problems = []
+
+def _rm(prob, msg):
+    def fn():
+        global _test_problems
+        try:
+            _test_problems.remove(prob)
+        except ValueError:
+            pass
+        return f"[fixed] {msg}"
+    return fn
+
+def test_problems():
+    global _test_problems
+    if _test_problems:
+        return _test_problems
+    items = [
+        (SEV_CRIT, "SMART FAILED: /dev/sda",
+         "Simulated drive failure — back up immediately.",                          "backup tips",    "simulated: dd backup"),
+        (SEV_CRIT, "91°C x86_pkg_temp",
+         "Simulated critical temp — check cooling.",                                "sensors",        "simulated: sensors output"),
+        (SEV_CRIT, "12 EDAC memory error(s)",
+         "Simulated memory errors — run memtest86.",                                "edac report",    "simulated: edac report"),
+        (SEV_WARN, "Battery worn 30%",
+         "Simulated: Design 50.0Wh, current 35.0Wh.",                              "battery info",   "simulated: battery report"),
+        (SEV_CRIT, "3 failed systemd unit(s)",
+         "Simulated: sshd.service, NetworkManager.service failed.",                 "restart all",    "simulated: systemctl restart"),
+        (SEV_WARN, "5 zombie process(es)",
+         "Simulated zombies — reap them.",                                          "reap zombies",   "simulated: reaped 5 zombies"),
+        (SEV_CRIT, "8 OOM kill(s) today",
+         "Simulated out-of-memory events.",                                         "check memory",   "simulated: memory check"),
+        (SEV_WARN, "Journal 800 MB",
+         "Simulated oversized journal.",                                            "vacuum to 200M", "simulated: journal vacuum"),
+        (SEV_CRIT, "sda1 at 95% capacity",
+         "Simulated disk full.",                                                    "auto-clean",     "simulated: disk cleanup"),
+        (SEV_WARN, "DNS slow (2340ms)",
+         "Simulated slow DNS resolution.",                                          "test 1.1.1.1",   "simulated: DNS test"),
+        (SEV_CRIT, "12 SSH auth failures",
+         "Simulated brute-force attempts.",                                         "security tips",  "simulated: fail2ban install"),
+        (SEV_INFO, "Uptime 120 days",
+         "Simulated long uptime — reboot for kernel updates.",                      "reboot?",        "simulated: reboot"),
+    ]
+    for sev, title, detail, fix_label, msg in items:
+        prob = Problem(sev, title, detail, fix_label)
+        prob.fix_fn = _rm(prob, msg)
+        _test_problems.append(prob)
+    return _test_problems
+
 # ── data ──────────────────────────────────────────────────────────────────────
 class Data:
     def __init__(self):
         self.lock = threading.Lock()
         self.d = {}
+        self.prev_net = {}
+        self.prev_disk = {}
+        self.prev_time = time.time()
+        self.cpu_hist = []
+        self.mem_hist = []
         self.collect()
 
     def collect(self):
@@ -109,6 +308,9 @@ class Data:
             d["cpu_freq"] = f"{int(read('/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq'))//1000} MHz"
         except:
             d["cpu_freq"] = "n/a"
+
+        d["cpu_hist"] = (self.cpu_hist + [d["cpu_pct"]])[-40:]
+        self.cpu_hist = d["cpu_hist"]
 
         # temps
         d["temps"] = []
@@ -150,6 +352,9 @@ class Data:
                 except: pass
         d["mem_errors"] = errs
 
+        d["mem_hist"] = (self.mem_hist + [d["mem_pct"]])[-40:]
+        self.mem_hist = d["mem_hist"]
+
         # gpu
         if os.path.exists("/usr/bin/nvidia-smi"):
             d["gpu"] = sh("nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu --format=csv,noheader,nounits")
@@ -175,9 +380,27 @@ class Data:
         d["zombies"]    = sh("ps --no-headers -eo stat | grep -c '^Z'","0")
         d["oom_events"] = sh("journalctl -k --since today 2>/dev/null | grep -c 'Out of memory\\|oom_kill'","0")
 
+        # load / uptime
+        try:
+            load = Path("/proc/loadavg").read_text().split()
+            d["load"] = " ".join(load[:3])
+            ut = float(read("/proc/uptime","0").split()[0])
+            d["uptime_days"] = ut / 86400
+        except: pass
+
         # systemd
         d["failed_units"] = [l for l in sh("systemctl --failed --no-legend").splitlines() if l.strip()]
         d["journal_errs"] = sh("journalctl -p err -n 4 --no-pager --no-hostname -o short").splitlines()
+
+        # journal size
+        try:
+            out = sh("journalctl --disk-usage 2>/dev/null")
+            m = re.search(r"([\d.]+)\s*(\w)", out)
+            if m:
+                val, unit = float(m.group(1)), m.group(2)
+                mult = {"K":1,"M":1,"G":1024,"T":1024*1024}
+                d["journal_size_mb"] = val * mult.get(unit, 1)
+        except: pass
 
         # dmesg
         d["dmesg"] = sh("dmesg --level=warn,err,crit,alert,emerg").splitlines()[-5:]
@@ -191,6 +414,67 @@ class Data:
         d["dns_ms"]   = sh("bash -c 't=$(($(date +%s%3N))); drill archlinux.org @1.1.1.1 >/dev/null 2>&1; echo $(($(date +%s%3N)-t))'","n/a")
         d["ports"]    = sh("ss -tlnp 2>/dev/null | awk 'NR>1{print $4}' | grep -oP ':\\K\\d+' | sort -un | tr '\\n' ' '")
         d["fw"] = sh("sudo -n iptables -L INPUT -n 2>/dev/null | grep -cE '^(ACCEPT|DROP|REJECT)'","n/a")
+
+        # network throughput (monitor mode)
+        try:
+            net_raw = {}
+            for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+                parts = line.split()
+                iface = parts[0].rstrip(":")
+                if iface != "lo":
+                    net_raw[iface] = (int(parts[1]), int(parts[9]))
+            now = time.time()
+            dt_net = now - self.prev_time
+            if self.prev_net and dt_net > 0:
+                rates = {}
+                for iface, (rx, tx) in net_raw.items():
+                    if iface in self.prev_net:
+                        drx = max(0, (rx - self.prev_net[iface][0]) / dt_net)
+                        dtx = max(0, (tx - self.prev_net[iface][1]) / dt_net)
+                        rates[iface] = (drx, dtx)
+                if rates: d["net_rates"] = rates
+            self.prev_net = net_raw
+            self.prev_time = now
+        except: pass
+
+        # disk throughput (monitor mode)
+        try:
+            disk_raw = {}
+            for dev_path in sorted(Path("/sys/block").iterdir()):
+                name = dev_path.name
+                if name.startswith(("sd","nvme","vd","mmc")):
+                    st = dev_path / "stat"
+                    if st.exists():
+                        f = st.read_text().split()
+                        disk_raw[name] = (int(f[2])*512, int(f[6])*512)
+            if self.prev_disk and dt_net > 0:
+                rates = {}
+                for dev, (r, w) in disk_raw.items():
+                    if dev in self.prev_disk:
+                        dr = max(0, (r - self.prev_disk[dev][0]) / dt_net)
+                        dw = max(0, (w - self.prev_disk[dev][1]) / dt_net)
+                        rates[dev] = (dr, dw)
+                if rates: d["disk_rates"] = rates
+            self.prev_disk = disk_raw
+        except: pass
+
+        # battery
+        try:
+            bat = Path("/sys/class/power_supply/BAT0")
+            if bat.exists():
+                ed = read(bat/"energy_full_design") or read(bat/"charge_full_design")
+                en = read(bat/"energy_full") or read(bat/"charge_full")
+                enow = read(bat/"energy_now") or read(bat/"charge_now")
+                if ed and en:
+                    ed_v, en_v = float(ed), float(en)
+                    d["battery_design"] = round(ed_v / 1e6, 1) if ed_v > 1e9 else round(ed_v / 1e3, 1)
+                    d["battery_now"] = round(en_v / 1e6, 1) if en_v > 1e9 else round(en_v / 1e3, 1)
+                    d["battery_wear"] = max(0, 100 * (ed_v - en_v) / ed_v) if ed_v else 0
+                if enow and en:
+                    enow_v, en_v = float(enow), float(en)
+                    d["battery_pct"] = round(100 * enow_v / en_v) if en_v else 0
+                d["battery_status"] = read(bat/"status","unknown")
+        except: pass
 
         # security
         d["last_logins"] = [l for l in sh("last -n 4 --time-format iso 2>/dev/null").splitlines() if l and "wtmp" not in l][:4]
@@ -211,7 +495,7 @@ class Data:
                 break
         d["updates"] = upd
 
-        # partitions
+        # partitions (with used_frac for problem detection)
         d["disks"] = []
         try:
             raw = sh("lsblk -Jbpo NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL")
@@ -248,6 +532,8 @@ class Data:
                         "label":  child.get("label") or "",
                         "used":   human(used) if used is not None else "",
                         "avail":  human(avail) if avail is not None else "",
+                        "used_b": used or 0,
+                        "used_frac": used/csize if used and csize else 0,
                     })
 
                 unalloc = disk_size - sum(pt["size_b"] for pt in parts)
@@ -255,6 +541,7 @@ class Data:
                     parts.append({
                         "name":"unallocated","size_b":unalloc,"size":human(unalloc),
                         "fstype":"","mounts":[],"label":"","used":"","avail":"",
+                        "used_b":0,"used_frac":0,
                     })
 
                 d["disks"].append({
@@ -274,8 +561,286 @@ class Data:
         with self.lock:
             return dict(self.d)
 
-# ── draw ──────────────────────────────────────────────────────────────────────
-def draw(stdscr, data_obj):
+# ── draw: default mode (repair menu) ──────────────────────────────────────────
+def draw_default(stdscr, data_obj, test_mode=False):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(200)
+    curses.start_color()
+    curses.use_default_colors()
+
+    accent = load_accent()
+    if accent and curses.can_change_color():
+        r,g,b = accent
+        curses.init_color(10, r*1000//255, g*1000//255, b*1000//255)
+        curses.init_pair(1, 10, -1)
+    else:
+        curses.init_pair(1, curses.COLOR_YELLOW, -1)
+    curses.init_pair(2, curses.COLOR_WHITE,  -1)
+    curses.init_pair(3, curses.COLOR_GREEN,  -1)
+    curses.init_pair(4, curses.COLOR_RED,    -1)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
+    curses.init_pair(6, curses.COLOR_CYAN,   -1)
+    curses.init_pair(7, curses.COLOR_MAGENTA,-1)
+
+    AC = curses.color_pair(1)
+    NM = curses.color_pair(2)
+    OK = curses.color_pair(3)
+    ER = curses.color_pair(4)
+    WN = curses.color_pair(5)
+    DM = curses.color_pair(6)
+    MG = curses.color_pair(7)
+
+    last_refresh = 0
+    fix_msg = ""
+    fix_msg_timer = 0
+    pending_fix = None
+    sel = 0
+
+    while True:
+        key = stdscr.getch()
+        if key in (ord('q'), ord('Q')) and pending_fix is None:
+            break
+        if key == 27 and pending_fix is None:
+            break
+
+        now = time.time()
+        if now - last_refresh >= REFRESH:
+            threading.Thread(target=data_obj.collect, daemon=True).start()
+            last_refresh = now
+
+        if fix_msg and now - fix_msg_timer > 4:
+            fix_msg = ""
+
+        d = data_obj.get()
+        if not d:
+            continue
+
+        H, W = stdscr.getmaxyx()
+        if H < 10 or W < 40:
+            stdscr.erase()
+            sadd(stdscr, 0, 0, "Terminal too small", ER | curses.A_BOLD)
+            stdscr.refresh()
+            continue
+        stdscr.erase()
+
+        hn = sh("uname -n")
+        ts = time.strftime("%H:%M")
+
+        # ── data ───────────────────────────────────────────────────────────────
+        problems = test_problems() if test_mode else detect_problems(d)
+        fixable = [(i, pr) for i, pr in enumerate(problems) if pr.fix_fn]
+
+        if problems:
+            sel = max(0, min(sel, len(problems) - 1))
+        else:
+            sel = 0
+
+        cpu = d.get("cpu_pct", 0)
+        mu = d.get("mem_used", 0); mt = d.get("mem_total", 1)
+        mp = d.get("mem_pct", 0)
+        load = d.get("load", "?")
+        upt = d.get("uptime_days", 0)
+        temp_tags = []
+        for t in d.get("temps", []):
+            if ":" in t:
+                lbl, val = t.rsplit(":", 1)
+                temp_tags.append(f"{lbl[:6]}:{val}")
+        temps_str = "  ".join(temp_tags[:4]) if temp_tags else ""
+
+        n_crit = sum(1 for pr in problems if pr.severity >= 2)
+        n_warn = sum(1 for pr in problems if pr.severity == SEV_WARN)
+        n_info = sum(1 for pr in problems if pr.severity == SEV_INFO)
+        tag_parts = []
+        if n_crit: tag_parts.append(f"{n_crit} critical")
+        if n_warn: tag_parts.append(f"{n_warn} warning")
+        if n_info: tag_parts.append(f"{n_info} info")
+        tag_str = ", ".join(tag_parts) if tag_parts else "none"
+
+        # ── header ─────────────────────────────────────────────────────────────
+        for i in range(H):
+            for j in range(W):
+                ch = ' '
+                if i == 0 and j == 0: ch = '┌'
+                elif i == 0 and j == W - 1: ch = '┐'
+                elif i == H - 1 and j == 0: ch = '└'
+                elif i == H - 1 and j == W - 1: ch = '┘'
+                elif i == 0 or i == H - 1: ch = '─'
+                elif j == 0 or j == W - 1: ch = '│'
+                sadd(stdscr, i, j, ch, AC)
+        tag = " [TEST MODE]" if test_mode else ""
+        sadd(stdscr, 0, 2, f" sysdiag{tag} — {hn}  {ts}"[:W - 4], AC | curses.A_BOLD)
+
+        # ── list header ────────────────────────────────────────────────────────
+        cnt = f"Issues ({tag_str})"
+        y = 2
+        sadd(stdscr, y, 2, cnt[:W - 4], AC | curses.A_BOLD)
+        y += 1
+        for x in range(2, W - 2):
+            sadd(stdscr, y, x, "─", DM)
+        y += 1
+
+        # ── items ──────────────────────────────────────────────────────────────
+        max_y = H - 6
+        if not problems:
+            sadd(stdscr, y, 4, "✓  No problems detected", OK | curses.A_BOLD)
+            y = max_y
+        else:
+            for idx, prob in enumerate(problems):
+                if y >= max_y: break
+                _, fi_idx = next(((fi, i) for fi, (i, _) in enumerate(fixable) if i == idx), (None, None))
+                is_sel = (idx == sel)
+                sev_tag = "CRIT" if prob.severity >= 2 else "WARN" if prob.severity == SEV_WARN else "INFO"
+                col = ER if prob.severity >= 2 else WN if prob.severity == SEV_WARN else DM
+                text = f"{sev_tag}  {prob.title}"
+                if is_sel:
+                    for x in range(2, W - 2):
+                        sadd(stdscr, y, x, " ", AC | curses.A_REVERSE)
+                    sadd(stdscr, y, 3, f"▸ {text}"[:W - 6], AC | curses.A_REVERSE | curses.A_BOLD)
+                    if fi_idx is not None:
+                        sadd(stdscr, y, W - 5 - len(str(fi_idx + 1)), f"[{fi_idx + 1}]", MG | curses.A_BOLD)
+                else:
+                    sadd(stdscr, y, 3, f"  {text}"[:W - 6], col | curses.A_BOLD)
+                    if fi_idx is not None:
+                        sadd(stdscr, y, W - 5 - len(str(fi_idx + 1)), f"[{fi_idx + 1}]", MG | curses.A_BOLD)
+                y += 1
+
+        # ── separator before info ──────────────────────────────────────────────
+        y = max(y, H - 5)
+        for x in range(2, W - 2):
+            sadd(stdscr, y, x, "─", DM)
+        y += 1
+
+        # ── system info ────────────────────────────────────────────────────────
+        l1 = f"CPU {cpu}% {bar(cpu,10)}  Mem {gb(mu)}/{gb(mt)}GB {bar(mp,6)}  Load {load}"
+        sadd(stdscr, y, 2, l1[:W - 4], DM)
+        y += 1
+        parts = []
+        if temps_str: parts.append(temps_str)
+        parts.append(f"Up {upt:.1f}d")
+        if d.get("ip"): parts.append(f"IP {d['ip']}")
+        if d.get("battery_pct") is not None: parts.append(f"Bat {d['battery_pct']}%")
+        parts.append(f"Updates {d.get('updates','?')}")
+        sadd(stdscr, y, 2, "  ".join(parts)[:W - 4], DM)
+
+        # ── footer bar ─────────────────────────────────────────────────────────
+        footer = "q quit"
+        if test_mode:
+            footer = "TEST MODE  " + footer
+        if _fix_busy.is_set():
+            footer = "  fixing...  " + footer
+        elif fix_msg:
+            footer = "  " + fix_msg + "  " + footer
+        if problems and not _fix_busy.is_set():
+            footer += "  |  ↑↓  enter"
+        for x in range(1, W - 1):
+            sadd(stdscr, H - 1, x, " ", AC | curses.A_REVERSE)
+        sadd(stdscr, H - 1, 2, footer[:W - 4], AC | curses.A_REVERSE)
+
+        # ── info / fix overlay ──────────────────────────────────────────────────
+        if pending_fix is not None:
+            idx, pr = pending_fix
+            has_fix = pr.fix_fn is not None
+            bw = min(56, W - 4)
+            bh = 9 if has_fix else 8
+            bx = (W - bw) // 2
+            by = (H - bh) // 2
+            col = ER if pr.severity >= 2 else WN
+            sev = "CRITICAL" if pr.severity >= 2 else "WARNING" if pr.severity == SEV_WARN else "INFO"
+
+            for y in range(bh):
+                for x in range(bw):
+                    ch = ' '
+                    if y == 0: ch = '─'
+                    if x == 0: ch = '│'
+                    if y == 0 and x == 0: ch = '┌'
+                    if y == 0 and x == bw-1: ch = '┐'
+                    if y == bh-1 and x == 0: ch = '└'
+                    if y == bh-1 and x == bw-1: ch = '┘'
+                    if 0 < y < bh-1 and 0 < x < bw-1: ch = ' '
+                    if y == bh-1 and 0 < x < bw-1: ch = '─'
+                    sadd(stdscr, by+y, bx+x, ch, AC if (y==0 or y==bh-1 or x==0 or x==bw-1) else 0)
+
+            sadd(stdscr, by, bx+2, f" {sev} ", col | curses.A_BOLD)
+            sadd(stdscr, by+2, bx+2, pr.title[:bw-4], col | curses.A_BOLD)
+            for i, line in enumerate(pr.detail.split('\n')[:2]):
+                sadd(stdscr, by+3+i, bx+2, line[:bw-4], DM)
+            if has_fix and pr.fix_label:
+                sadd(stdscr, by+5, bx+2, f"Fix: {pr.fix_label}", DM)
+            if has_fix:
+                sadd(stdscr, by+bh-2, bx+2, " y = execute    n / ESC = cancel ", AC | curses.A_BOLD)
+            else:
+                sadd(stdscr, by+bh-2, bx+2, " press any key to dismiss ", AC | curses.A_BOLD)
+
+        stdscr.refresh()
+
+        # ── input handling ──────────────────────────────────────────────────────
+        if _fix_busy.is_set():
+            while stdscr.getch() != -1:
+                pass
+            if fix_msg:
+                pass
+        elif pending_fix is not None:
+            idx, pr = pending_fix
+            has_fix = pr.fix_fn is not None
+            if has_fix and key in (ord('y'), ord('Y')) and not _fix_busy.is_set():
+                _fix_busy.set()
+                curses.flushinp()
+                while stdscr.getch() != -1:
+                    pass
+                fix_msg = f"fixing: {pr.title}..."
+                fix_msg_timer = time.time()
+                threading.Thread(target=lambda p=pr: _run_fix(p), daemon=True).start()
+                pending_fix = None
+            elif has_fix and key in (ord('n'), ord('N'), 27):
+                pending_fix = None
+                fix_msg = "Cancelled"
+                fix_msg_timer = time.time()
+            elif ord('1') <= key <= ord('9'):
+                fi = key - ord('1')
+                if fi < len(fixable):
+                    idx, pr = fixable[fi]
+                    pending_fix = (idx, pr)
+            elif not has_fix:
+                pending_fix = None
+            elif key in (ord('\n'), ord('\r')):
+                pass
+        elif not _fix_busy.is_set():
+            if key == curses.KEY_UP and problems:
+                sel = (sel - 1) % len(problems)
+            elif key == curses.KEY_DOWN and problems:
+                sel = (sel + 1) % len(problems)
+            elif key in (ord('\n'), ord('\r')) and problems:
+                pr = problems[sel]
+                pending_fix = (sel, pr)
+                fix_msg = f"Selected: {pr.title}"
+                fix_msg_timer = time.time()
+            elif key >= ord('1') and key <= ord('9'):
+                fi = key - ord('1')
+                if fi < len(fixable):
+                    fi_idx, pr = fixable[fi]
+                    sel = fi_idx
+                    pending_fix = (fi_idx, pr)
+                    fix_msg = f"Selected: {pr.title}"
+                    fix_msg_timer = time.time()
+
+def fix_worker(prob):
+    try:
+        r = prob.fix_fn()
+        if r:
+            prob.detail = str(r)[:80]
+    except Exception as e:
+        prob.detail = f"fix error: {e}"
+
+def _run_fix(prob):
+    try:
+        fix_worker(prob)
+    finally:
+        time.sleep(0.5)
+        _fix_busy.clear()
+
+# ── draw: monitor mode ───────────────────────────────────────────────────────
+def draw_monitor(stdscr, data_obj):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -319,11 +884,18 @@ def draw(stdscr, data_obj):
             continue
 
         H, W = stdscr.getmaxyx()
+        if H < 10 or W < 40:
+            stdscr.erase()
+            sadd(stdscr, 0, 0, "Terminal too small", ER | curses.A_BOLD)
+            stdscr.refresh()
+            continue
         stdscr.erase()
 
         hn = sh("uname -n")
-        ts = time.strftime("%A %d %B %Y  %H:%M:%S")
-        sadd(stdscr, 0, 0, f" sysdiag  {hn}  {ts} ".center(W), AC | curses.A_BOLD)
+        load = d.get("load","")
+        upt = d.get("uptime_days",0)
+        ts = time.strftime("%H:%M:%S")
+        sadd(stdscr, 0, 0, f" sysdiag --monitor  {hn}  {load}  uptime:{upt:.1f}d  {ts} ".center(W), AC | curses.A_BOLD)
 
         usable = H - 2
         disks  = d.get("disks",[])
@@ -355,7 +927,9 @@ def draw(stdscr, data_obj):
             cores = d.get("cpu_cores",[])
             core_str = "  ".join(f"c{i}:{cp}%" for i,cp in enumerate(cores))
             sadd(p,3,2,core_str[:pw-4],DM)
-            sadd(p,ph-2,2,f"ctx: {d.get('ctx','?')}  intr: {d.get('intr','?')}",DM)
+            hist = d.get("cpu_hist",[])
+            if hist and pw > 8:
+                sadd(p,ph-2,2,sparkline(hist, pw-4)[:pw-4],AC)
         except Exception: pass
 
         # ── memory ────────────────────────────────────────────────────────────
@@ -372,6 +946,9 @@ def draw(stdscr, data_obj):
             sadd(p,4,2,f"dirty: {d.get('dirty_mb',0)} MB  wb: {d.get('wb_mb',0)} MB  huge: {d.get('huge_free',0)}/{d.get('huge_total',0)}",DM)
             errs=d.get("mem_errors",0)
             sadd(p,5,2,"[ok] no memory errors" if not errs else f"[!!] edac errors: {errs}", OK if not errs else ER)
+            hist = d.get("mem_hist",[])
+            if hist and pw > 8 and ph > 6:
+                sadd(p,ph-2,2,sparkline(hist, pw-4)[:pw-4],AC)
         except Exception: pass
 
         # ── temps & fans ──────────────────────────────────────────────────────
@@ -394,13 +971,20 @@ def draw(stdscr, data_obj):
             sadd(p,y,2,("fans: "+"  ".join(fans)) if fans else "fans: no data",DM)
         except Exception: pass
 
-        # ── gpu & storage ─────────────────────────────────────────────────────
+        # ── disk i/o + smart ─────────────────────────────────────────────────
         try:
             p = pan(1,"r"); ph,pw = p.getmaxyx()
-            draw_box(p,"gpu & storage",AC,AC)
-            sadd(p,1,2,"gpu:",DM); sadd(p,1,6,d.get("gpu","n/a")[:pw-8],NM)
-            sadd(p,2,2,"smart:",DM)
-            y=3
+            draw_box(p,"disk i/o & smart",AC,AC)
+            disk_rates = d.get("disk_rates", {})
+            y = 1
+            top = list(sorted(disk_rates.items()))[:3]
+            if top:
+                for dev, (rd, wr) in top:
+                    sadd(p,y,2,f"{dev} R {human_rate(rd):>8}  W {human_rate(wr):>8}"[:pw-4],DM)
+                    y += 1
+            else:
+                sadd(p,y,2,"disk i/o: sampling...",DM); y += 1
+            sadd(p,y,2,"smart:",DM); y += 1
             for dev,result in d.get("smart",[]):
                 col = OK if "PASSED" in result.upper() else ER
                 sadd(p,y,2,dev,DM); sadd(p,y,2+len(dev)+1,result,col|curses.A_BOLD)
@@ -424,49 +1008,55 @@ def draw(stdscr, data_obj):
             sadd(p,ph-2,27,str(oom),ER|curses.A_BOLD if oom else OK)
         except Exception: pass
 
-        # ── systemd & journal ─────────────────────────────────────────────────
+        # ── network + battery ─────────────────────────────────────────────────
         try:
             p = pan(2,"r"); ph,pw = p.getmaxyx()
-            draw_box(p,"systemd & journal",AC,AC)
-            fu=d.get("failed_units",[])
-            if fu:
-                sadd(p,1,2,"failed units:",ER)
-                for i,u in enumerate(fu[:2]): sadd(p,2+i,2,u[:pw-4],ER|curses.A_BOLD)
-            else:
-                sadd(p,1,2,"[ok] no failed units",OK)
-            sadd(p,3,2,"journal errors:",DM)
-            jerrs=d.get("journal_errs",[])
-            if jerrs:
-                for i,line in enumerate(jerrs[:ph-6]): sadd(p,4+i,2,line[:pw-4],WN)
-            else:
-                sadd(p,4,2,"[ok] clean",OK)
+            draw_box(p,"network & battery",AC,AC)
+            iface = d.get("iface","?")
+            sadd(p,1,2,f"iface: ",DM); sadd(p,1,9,iface,NM|curses.A_BOLD)
+            sadd(p,1,17,f"  ip: ",DM); sadd(p,1,23,d.get("ip","?"),NM)
+            net_rates = d.get("net_rates",{})
+            if iface in net_rates:
+                rx, tx = net_rates[iface]
+                sadd(p,2,2,f"RX: {human_rate(rx):>8}  TX: {human_rate(tx):>8}"[:pw-4],DM)
+            sadd(p,3,2,f"gw: {d.get('gw','?')}  ping: {d.get('ping_ext','?')}  dns: {d.get('dns_ms','?')}ms",DM)
+            bat_pct = d.get("battery_pct")
+            if bat_pct is not None:
+                bstat = d.get("battery_status","")
+                bw = d.get("battery_wear",0)
+                sadd(p,ph-2,2,f"battery: {bat_pct}% ({bstat})",DM)
+                if bw > 0:
+                    sadd(p,ph-2,30,f"wear: {bw:.0f}%",WN if bw > 20 else DM)
         except Exception: pass
 
-        # ── network ───────────────────────────────────────────────────────────
+        # ── security & systemd ────────────────────────────────────────────────
         try:
             p = pan(3,"l"); ph,pw = p.getmaxyx()
-            draw_box(p,"network",AC,AC)
-            sadd(p,1,2,"iface: ",DM); sadd(p,1,9,d.get("iface","?"),NM|curses.A_BOLD)
-            sadd(p,1,17,"  ip: ",DM); sadd(p,1,23,d.get("ip","?"),NM)
-            sadd(p,2,2,f"gw: {d.get('gw','?')}  ping gw: {d.get('ping_gw','?')}  ext: {d.get('ping_ext','?')}  dns: {d.get('dns_ms','?')}ms",DM)
-            sadd(p,3,2,"ports: ",DM); sadd(p,3,9,(d.get("ports","") or "none")[:pw-12],NM)
-            sadd(p,4,2,f"fw rules (INPUT): {d.get('fw','?')}",DM)
-            dw=d.get("dmesg",[])
-            if dw:
-                sadd(p,5,2,"dmesg:",WN)
-                for i,line in enumerate(dw[:ph-8]): sadd(p,6+i,2,line[:pw-4],WN)
+            draw_box(p,"security & systemd",AC,AC)
+            sadd(p,1,2,f"suid: {d.get('suid','?')}  ssh fails: {d.get('ssh_fails','?')}  updates: {d.get('updates','?')}",NM)
+            fu=d.get("failed_units",[])
+            if fu:
+                sadd(p,2,2,"failed units:",ER)
+                for i,u in enumerate(fu[:1]): sadd(p,3+i,2,u[:pw-4],ER|curses.A_BOLD)
             else:
-                sadd(p,5,2,"[ok] dmesg clean",OK)
+                sadd(p,2,2,"[ok] no failed units",OK)
+            sadd(p,ph-2,2,"last logins:",DM)
+            for i,line in enumerate(d.get("last_logins",[])[:ph-5]):
+                sadd(p,ph-3+i,2,line[:pw-4],DM)
         except Exception: pass
 
-        # ── security ──────────────────────────────────────────────────────────
+        # ── dmesg + ports + firewall ─────────────────────────────────────────
         try:
             p = pan(3,"r"); ph,pw = p.getmaxyx()
-            draw_box(p,"security",AC,AC)
-            sadd(p,1,2,f"suid: {d.get('suid','?')}  ssh fails: {d.get('ssh_fails','?')}  updates: {d.get('updates','?')}",NM)
-            sadd(p,2,2,"last logins:",DM)
-            for i,line in enumerate(d.get("last_logins",[])[:ph-5]):
-                sadd(p,3+i,2,line[:pw-4],DM)
+            draw_box(p,"kernel & firewall",AC,AC)
+            sadd(p,1,2,"ports: ",DM); sadd(p,1,9,(d.get("ports","") or "none")[:pw-12],NM)
+            sadd(p,2,2,f"fw rules (INPUT): {d.get('fw','?')}",DM)
+            dw=d.get("dmesg",[])
+            if dw:
+                sadd(p,3,2,"dmesg:",WN)
+                for i,line in enumerate(dw[:ph-5]): sadd(p,4+i,2,line[:pw-4],WN)
+            else:
+                sadd(p,3,2,"[ok] dmesg clean",OK)
         except Exception: pass
 
         # ── partitions ────────────────────────────────────────────────────────
@@ -483,7 +1073,6 @@ def draw(stdscr, data_obj):
                 y = 2
                 for disk in disks:
                     if y >= ph - 1: break
-                    # disk header line
                     label = f"  ({disk['label']})" if disk['label'] else ""
                     sadd(p, y, 2, f"{disk['name']}{label}  {disk['size']}", AC | curses.A_BOLD)
                     y += 1
@@ -493,8 +1082,9 @@ def draw(stdscr, data_obj):
                         is_unalloc = part["name"] == "unallocated"
                         name_short = part["name"].replace("/dev/","")
                         col = DM if is_unalloc else NM
+                        if part.get("used_frac",0) > 0.90 and not is_unalloc:
+                            col = ER | curses.A_BOLD
 
-                        # build partition line
                         fields = [f"  {name_short}"]
                         if part["fstype"]: fields.append(part["fstype"])
                         fields.append(part["size"])
@@ -505,30 +1095,33 @@ def draw(stdscr, data_obj):
                         sadd(p, y, 2, "  ".join(fields)[:W-4], col)
                         y += 1
 
-                        # mountpoints indented below
                         for mount in part["mounts"]:
                             if y >= ph - 1: break
                             sadd(p, y, 6, mount, DM)
                             y += 1
 
-                    y += 1  # gap between disks
+                    y += 1
         except Exception: pass
 
-        sadd(stdscr, H-1, 0, f" q quit  refresh every {REFRESH}s ".ljust(W), AC | curses.A_REVERSE)
+        sadd(stdscr, H-1, 0, f" q quit  --monitor  refresh every {REFRESH}s ".ljust(W), AC | curses.A_REVERSE)
         stdscr.refresh()
 
-    try:
-        curses.endwin()
-    except Exception:
-        pass
+# ── draw dispatcher ──────────────────────────────────────────────────────────
+def draw(stdscr, data_obj, monitor_mode, test_mode):
+    if monitor_mode:
+        draw_monitor(stdscr, data_obj)
+    else:
+        draw_default(stdscr, data_obj, test_mode)
 
 # ── entry ─────────────────────────────────────────────────────────────────────
 def main():
-    # authenticate once before TUI takes over the terminal
-    os.system("sudo -v")
+    monitor = "--monitor" in sys.argv
+    test_mode = "--test" in sys.argv
+    if not monitor:
+        os.system("sudo -v")
     data = Data()
     try:
-        curses.wrapper(lambda s: draw(s, data))
+        curses.wrapper(lambda s: draw(s, data, monitor, test_mode))
     except KeyboardInterrupt:
         pass
 
